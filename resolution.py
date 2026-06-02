@@ -3,24 +3,94 @@ import sys
 import argparse
 import re
 import os
+import shutil
+import csv
+import itertools
+import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-s", type=str, required=True, help="Le chemin vers le dossier contenant les data")
 parser.add_argument("--use_mask", action="store_true")
-parser.add_argument("-r", type=str, default="1", help="La liste des résolutions à lancer")
-args = parser.parse_args()
+
+parser.add_argument("-r", nargs='+', default=["1"], help="Liste des résolutions")
+parser.add_argument("--densify_grad_threshold", nargs='+', default=["0.0002"], help="Liste des thresholds de densification")
+parser.add_argument("--scaling_lr", nargs='+', help="Liste des learning rates pour le scaling (optionnel)")
+parser.add_argument("--densify_until_iter", nargs='+', help="Liste des itérations de densification s'arrêtant (optionnel)")
+
+args, extra_args = parser.parse_known_args()
 
 script_a_lancer = "train.py"
-liste_res = args.r.split(" ")
-
 chemins_extraits = []
+csv_file = "/app/output/training_metrics.csv"
 
-for res in liste_res:
-    commande = [sys.executable, "-u", script_a_lancer, "-s", args.s, "-r", res]
+mapping_suffix = {
+    "-r": "r",
+    "--densify_grad_threshold": "d",
+    "--scaling_lr": "s",
+    "--densify_until_iter": "ds"
+}
+
+mapping_header = {
+    "-r": "Resolution",
+    "--densify_grad_threshold": "Densification",
+    "--scaling_lr": "Scaling",
+    "--densify_until_iter": "Densification_Stop"
+}
+
+params_dict = {
+    "-r": args.r,
+    "--densify_grad_threshold": args.densify_grad_threshold,
+}
+
+if args.scaling_lr:
+    params_dict["--scaling_lr"] = args.scaling_lr
+if args.densify_until_iter:
+    params_dict["--densify_until_iter"] = args.densify_until_iter
+
+keys = list(params_dict.keys())
+values = list(params_dict.values())
+combinations = list(itertools.product(*values))
+
+base_name = os.path.basename(args.s.strip(os.sep))
+
+with open(csv_file, mode='w', newline='') as f:
+    writer = csv.writer(f)
+    header = ["Name"] + [mapping_header[k] for k in keys] + ["Mask", "Time_7000", "Time_30000"]
+    writer.writerow(header)
+
+
+for combo in combinations:
+    current_params = dict(zip(keys, combo))
+
+    # Génération du suffixe selon vos règles (r, d, s, ds)
+    parts = []
+    for k, v in current_params.items():
+        short_key = mapping_suffix[k]
+        parts.append(f"{short_key}{v}")
+    
+    suffixe = "_".join(parts)
+    
+    if args.use_mask:
+        suffixe += "_mask"
+        
+    new_name = f"{base_name}_{suffixe}"
+    model_path = os.path.join("output", new_name)
+    
+    commande = [sys.executable, "-u", script_a_lancer, "-s", args.s, "-m", model_path]
+    
+    # Ajouter des paramètres 
+    for k, v in current_params.items():
+        commande.extend([k, str(v)])
+    
     if args.use_mask:
         commande.extend(["--use_mask", "True", "--random_background"])
+    
+    commande.extend(extra_args)
 
-    print(f"\n--- Lancement résolution {res} ---")
+    # Affichage console
+    params_str = " | ".join([f"{mapping_header[k]}: {v}" for k, v in current_params.items()])
+    print(f"\n--- LANCEMENT : {params_str} ---")
+
     process = subprocess.Popen(
         commande, 
         stdout=subprocess.PIPE, 
@@ -29,46 +99,40 @@ for res in liste_res:
         bufsize=1
     )
 
-    chemin_trouve = None
+    time_7k = ""
+    time_30k = ""
+
     for line in process.stdout:
         clean_line = line.strip('\r\n')
+        
         if "Training progress" in clean_line:
             sys.stdout.write(f"\r{clean_line}")
             sys.stdout.flush()
+
+            match_time = re.search(r"(\d+)/30000\s+\[([\d:]+)<", clean_line)
+            if match_time:
+                iteration = int(match_time.group(1))
+                elapsed_time = match_time.group(2)
+                if 6980 <= iteration <= 7050 and not time_7k:
+                    time_7k = elapsed_time
+                if iteration >= 29990:
+                    time_30k = elapsed_time
         else:
             print(f"{clean_line}")
-            
-        match = re.search(r"Output folder:\s*(.*?)\s*\[", clean_line)
-        if match:
-            chemin_trouve = match.group(1).strip()
+    
     process.wait()
 
     if process.returncode == 0:
-        if chemin_trouve and os.path.exists(chemin_trouve):
-            base_name = os.path.basename(args.s.strip(os.sep))
-            suffix = f"_r{res}"
-            if args.use_mask:
-                suffix += "_mask"
-            
-            nouveau_nom = base_name + suffix
-            nouveau_chemin = os.path.join(os.path.dirname(chemin_trouve), nouveau_nom)
+        # Enregistrement dans le CSV
+        with open(csv_file, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            row = [base_name] + list(combo) + [args.use_mask, time_7k, time_30k]
+            writer.writerow(row)
 
-            try:
-                if os.path.exists(nouveau_chemin):
-                    import shutil
-                    shutil.rmtree(nouveau_chemin)
-                
-                os.rename(chemin_trouve, nouveau_chemin)
-                chemins_extraits.append(nouveau_chemin)
-                print(f"Dossier renommé en : {nouveau_nom}")
-            except Exception as e:
-                print(f"Erreur lors du renommage : {e}")
-                chemins_extraits.append(chemin_trouve)
-        else:
-            print(f"{chemin_trouve} inexistant")
+        chemins_extraits.append(model_path)
     else:
-        print(process.returncode)
+        print(f"\nERREUR : Code {process.returncode}")
 
-print("\nListe des dossier créés :")
+print("\nTerminé. Dossiers créés :")
 for c in chemins_extraits:
-    print(c)
+    print(f"- {c}")
