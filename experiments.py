@@ -14,7 +14,6 @@ parser.add_argument("--use_mask", action="store_true")
 
 parser.add_argument("-r", nargs='+', default=["1"], help="Liste des résolutions")
 parser.add_argument("--densify_grad_threshold", nargs='+', default=["0.0002"], help="Liste des thresholds de densification")
-parser.add_argument("--scaling_lr", nargs='+', help="Liste des learning rates pour le scaling (optionnel)")
 parser.add_argument("--densify_until_iter", nargs='+', help="Liste des itérations de densification s'arrêtant (optionnel)")
 
 args, extra_args = parser.parse_known_args()
@@ -26,14 +25,12 @@ csv_file = "/app/output/training_metrics.csv"
 mapping_suffix = {
     "-r": "r",
     "--densify_grad_threshold": "d",
-    "--scaling_lr": "s",
     "--densify_until_iter": "ds"
 }
 
 mapping_header = {
     "-r": "Resolution",
     "--densify_grad_threshold": "Densification",
-    "--scaling_lr": "Scaling",
     "--densify_until_iter": "Densification_Stop"
 }
 
@@ -42,8 +39,6 @@ params_dict = {
     "--densify_grad_threshold": args.densify_grad_threshold,
 }
 
-if args.scaling_lr:
-    params_dict["--scaling_lr"] = args.scaling_lr
 if args.densify_until_iter:
     params_dict["--densify_until_iter"] = args.densify_until_iter
 
@@ -74,7 +69,8 @@ for combo in combinations:
         suffixe += "_mask"
         
     new_name = f"{base_name}_{suffixe}"
-    model_path = os.path.join("output", new_name)
+    folder_path = os.path.join("output", base_name + ("_mask" if args.use_mask else ""))
+    model_path = os.path.join(folder_path, new_name)
     
     commande = [sys.executable, "-u", script_a_lancer, "-s", args.s, "-m", model_path]
     
