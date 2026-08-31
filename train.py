@@ -11,11 +11,13 @@
 
 import os
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import generate_novel_views, find_nearest_assignments
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
@@ -41,11 +43,34 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_mask, rescale_path):
+import warnings
+from diffusers.utils import logging as diffusers_logging
+from transformers import logging as transformers_logging
+diffusers_logging.set_verbosity_error()
+transformers_logging.set_verbosity_error()
+warnings.filterwarnings("ignore")
 
+from pipeline_difix import DifixPipeline
+from diffusers.utils import load_image
+       
+import torchvision.transforms.functional as TF
+import torch.nn.functional as F
+from torchvision.utils import save_image
+
+def clean_dir(path):
+    if not os.path.exists(path):
+        return
+    
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_mask, result, difix_iteration, difix_mode, difix_step, args_poses):
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    SAVE_INTERVAL = 10
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -64,14 +89,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
+    viewpowint_stack = []
+
+    if difix_iteration > 0:
+        difix = DifixPipeline.from_pretrained(
+            "nvidia/difix_ref", 
+            trust_remote_code=True,
+            low_cpu_mem_usage=False
+        )
+        difix.set_progress_bar_config(disable=True)
+
+        new_poses = generate_novel_views(scene.getTrainCameras().copy(), trajectory_type=difix_mode, **args_poses)
+
+    if result:
+        result_path = os.path.join(result, "render")
+        difix_path = os.path.join(result_path, "difix")
+        os.makedirs(result_path, exist_ok=True)
+        os.makedirs(difix_path, exist_ok=True)
+        clean_dir(result_path)
+        clean_dir(difix_path)
+        
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    if difix_iteration + opt.iterations != saving_iterations[-1]:
+        saving_iterations.append(opt.iterations + difix_iteration)
+    progress_bar = tqdm(range(first_iter, opt.iterations + difix_iteration), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):
+    for iteration in range(first_iter, opt.iterations + 1 + difix_iteration):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -89,25 +134,87 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
+        if not viewpowint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_indices = list(range(len(viewpoint_stack)))
+            if iteration > opt.iterations:
+                viewpoint_stack.extend(new_poses.copy())
+                viewpoint_indices.extend(list(range(len(viewpoint_stack), len(viewpoint_stack) + len(new_poses))))
+            
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+        if iteration >= opt.iterations and (iteration - opt.iterations) % difix_step == 1:
+            print(f"[ ITER {iteration} ] Difix3D correction")
+            ref_images = find_nearest_assignments(scene.getTrainCameras(), viewpoint_stack[-len(new_poses):])
+            for i, cam in tqdm(enumerate(viewpoint_stack[-len(new_poses):]), total=len(new_poses)):
+                render_pkg = render(cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+                last_image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                ref_image = ref_images[i].original_image.cuda() if not ref_images[i].original_image.is_cuda else ref_images[i].original_image
+
+                with torch.no_grad():
+                    img_input = last_image.unsqueeze(0) if len(last_image.shape) == 3 else last_image
+                    ref_input = ref_image.unsqueeze(0) if len(ref_image.shape) == 3 else ref_image
+                    
+                    difix_out = difix(
+                        prompt="remove degradation",
+                        image=img_input,
+                        ref_image=ref_input,
+                        num_inference_steps=1,
+                        timesteps=[199],
+                        guidance_scale=0.0,
+                        output_type="pt"
+                    )
+                    
+                    image_gpu = difix_out.images.to(last_image.device)
+                    
+                    target_size = img_input.shape[-2:]
+                    image_resized = F.interpolate(
+                        image_gpu,
+                        size=target_size, 
+                        mode="bicubic", 
+                        align_corners=False
+                    )
+                    image = image_resized.squeeze(0)
+                    image = image.to(last_image.dtype)
+                    cam.set_image(image)
+                    
+                if result:
+                    save_image(last_image, os.path.join(difix_path, f"{iteration}_{i}_render.png"))
+                    save_image(ref_image, os.path.join(difix_path, f"{iteration}_{i}_ref.png"))
+                    save_image(image, os.path.join(difix_path, f"{iteration}_{i}_difix.png"))
+
+                del render_pkg, last_image, image_gpu, image_resized, img_input, ref_input, difix_out
+                if not ref_image.is_cuda:
+                    del ref_image_gpu
+
+        torch.cuda.empty_cache()
+
+        while True:
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            vind = viewpoint_indices.pop(rand_idx)
+            
+            gt_image = viewpoint_cam.original_image.cuda()
+            device = gt_image.device
+
+            mask = torch.ones_like(gt_image)
+            bg_mask = torch.zeros_like(gt_image)
+            if use_mask and viewpoint_cam.mask is not None:
+                raw_mask = viewpoint_cam.mask.to(device)
+                mask = (raw_mask >= 0.5).to(gt_image.dtype)
+                bg_mask = bg.to(device).view(3, 1, 1) * (1.0 - mask)
+            
+            if not use_mask or mask.any().item():
+                break
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -117,30 +224,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image *= alpha_mask
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        
-        mask = torch.ones_like(gt_image)
-        bg_mask = torch.zeros_like(gt_image)
-        if use_mask and viewpoint_cam.mask is not None:
-            mask = viewpoint_cam.mask
-            mask[mask < 0.5] = 0.0
-            mask[mask >= 0.5] = 1.0
-
-            bg_mask = bg.view(3, 1, 1) * (1 - mask)
-        elif use_mask:
-            iter_end.record()
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-            continue
-
-        
-        if iteration in saving_iterations and rescale_path:
-            save_image(image, os.path.join(rescale_path, f"r_d{opt.densify_grad_threshold}__{iteration}.png"))
-            print(f"Saved image at {rescale_path}")
-
+        if result and (iteration % SAVE_INTERVAL == 0):
+            save_image(gt_image * mask + bg_mask, os.path.join(result_path, f"{iteration}_image.png"))
+            save_image(image, os.path.join(result_path, f"{iteration}_render.png"))
+            if use_mask:
+                save_image(mask, os.path.join(result_path, f"{iteration}_mask.png"))
         Ll1 = l1_loss(image, gt_image * mask + bg_mask)
 
         if FUSED_SSIM_AVAILABLE:
@@ -167,7 +255,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
         iter_end.record()
-
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -176,7 +263,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
-            if iteration == opt.iterations:
+            if iteration == opt.iterations + difix_iteration:
                 progress_bar.close()
 
             # Log and save
@@ -186,7 +273,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter or opt.iterations < iteration and iteration < opt.iterations + opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -195,11 +282,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if iteration > 1 and iteration % opt.opacity_reset_interval == 1 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations + difix_iteration:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
@@ -259,7 +346,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".fo&rmat(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     
@@ -304,21 +391,35 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--use_mask", type=bool, default=False, help="Use the mask to train the model")
-    parser.add_argument("--rescale_path", type=str, default=None, help="Path to folder for saved rescaled images")
+    parser.add_argument("--use_mask", action="store_true", help="Use the mask to train the model")
+    parser.add_argument("--result", type=str, default=None, help="Path to folder for saved rescaled images")
+    parser.add_argument("--difix_iteration", type=int, default=0, help="Step iteration for Difix3D correction")
+    parser.add_argument("--difix_step", type=int, default=2000, help="Step for Difix3D correction")
+    parser.add_argument("--difix_mode", type=str, default="interp", help="Difix3D correction mode (interp, spiral, ellipse, rotate)")
+    parser.add_argument("--args_poses", type=str, default="", help="Arguments for the pose generation")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
+    args_poses = {}
+    if args.args_poses:
+        for arg in args.args_poses.split(","):
+            key, value = arg.split("=")
+            args_poses[key] = value
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
+    if args.use_mask:
+        args.random_background = True
+
+
     # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.use_mask, args.rescale_path)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.use_mask, args.result, args.difix_iteration, args.difix_mode, args.difix_step, args_poses)
 
     # All done
     print("\nTraining complete.")
