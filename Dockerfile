@@ -9,11 +9,16 @@ ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6"
 
 
 RUN apt-get update && apt-get install -y \
-    curl git cmake wget build-essential ninja-build neovim nano ffmpeg\
-    libboost-program-options-dev libboost-filesystem-dev libboost-graph-dev libboost-system-dev \
-    libboost-iostreams-dev libsuitesparse-dev libfreeimage-dev libgoogle-glog-dev \
-    libgflags-dev libglew-dev libqt5opengl5-dev libcgal-dev libceres-dev \
-    libflann-dev libsqlite3-dev liblz4-dev libmetis-dev \
+    build-essential cmake curl ffmpeg git \
+    libassimp-dev libavcodec-dev libavdevice-dev \
+    libboost-all-dev libcgal-dev libceres-dev \
+    libeigen3-dev libembree-dev libflann-dev \
+    libfreeimage-dev libgflags-dev libglew-dev \
+    libglfw3-dev libgoogle-glog-dev libgtk-3-dev \
+    liblz4-dev libmetis-dev libopencv-dev \
+    libqt5opengl5-dev libsqlite3-dev libsuitesparse-dev \
+    libxxf86vm-dev nano neovim \
+    ninja-build wget cuda-toolkit \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
@@ -36,8 +41,24 @@ ENV PATH=/opt/conda/bin:/usr/local/bin:$PATH
 WORKDIR /app
 COPY . .
 
-RUN conda env create -f environment.yml
+RUN cd /app/SIBR_viewers && \
+    cmake -Bbuild . -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build -j$(nproc) --target install
+
+RUN git clone https://github.com/nv-tlabs/Difix3D.git
+ENV PYTHONPATH=/app/Difix3D/src
+
 RUN conda env create -f sam_environment.yaml
+RUN conda run -n sam3 pip install "git+https://github.com/facebookresearch/sam3.git"
+RUN conda run -n sam3 pip install torch torchvision --index-url "https://download.pytorch.org/whl/cu124"
+
+RUN conda env create -f environment.yml
+RUN conda run -n gaussian_splatting pip install submodules/diff-gaussian-rasterization --no-build-isolation
+RUN conda run -n gaussian_splatting pip install submodules/simple-knn --no-build-isolation
+RUN conda run -n gaussian_splatting pip install submodules/fused-ssim --no-build-isolation
+
+RUN conda env create -f aruco.yaml
+RUN conda run -n aruco pip install "git+https://github.com/meyerls/aruco-estimator.git"
 
 
 RUN conda init bash
